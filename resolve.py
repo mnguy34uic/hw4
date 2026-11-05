@@ -30,6 +30,9 @@ ROOT_SERVERS = ("198.41.0.4",
                 "199.7.83.42",
                 "202.12.27.33")
 
+EXACT_CACHE = {}
+INTERMEDIATE_CACHE = {}
+NS_LOOKUPS_IN_PROGRESS = set()
 
 def collect_results(name: str) -> dict:
     """
@@ -38,6 +41,7 @@ def collect_results(name: str) -> dict:
     """
     full_response = {}
     target_name = dns.name.from_text(name)
+
     # lookup CNAME
     response = lookup(target_name, dns.rdatatype.CNAME)
     cnames = []
@@ -46,6 +50,7 @@ def collect_results(name: str) -> dict:
         for answer in answers:
             cnames.append({"name": answer, "alias": tmp})
             tmp = answer
+
     # lookup A
     response = lookup(target_name, dns.rdatatype.A)
     arecords = []
@@ -54,6 +59,7 @@ def collect_results(name: str) -> dict:
         for answer in answers:
             if answer.rdtype == 1:  # A record
                 arecords.append({"name": a_name, "address": str(answer)})
+
     # lookup AAAA
     response = lookup(target_name, dns.rdatatype.AAAA)
     aaaarecords = []
@@ -62,6 +68,7 @@ def collect_results(name: str) -> dict:
         for answer in answers:
             if answer.rdtype == 28:  # AAAA record
                 aaaarecords.append({"name": aaaa_name, "address": str(answer)})
+
     # lookup MX
     response = lookup(target_name, dns.rdatatype.MX)
     mxrecords = []
@@ -90,9 +97,154 @@ def lookup(target_name: dns.name.Name,
     TODO: replace this implementation with one which asks the root servers
     and recurses to find the proper answer.
     """
+    cache_key = (target_name, qtype)
+
+    if cache_key in EXACT_CACHE:
+        return EXACT_CACHE[cache_key]
+
     outbound_query = dns.message.make_query(target_name, qtype)
-    response = dns.query.udp(outbound_query, "8.8.8.8", 3)
-    return response
+    servers = list(ROOT_SERVERS)
+    best_zone = None
+
+    for zone in INTERMEDIATE_CACHE:
+        if target_name.is_subdomain(zone):
+            if best_zone is None or len(zone) > len(best_zone):
+                best_zone = zone
+
+    if best_zone is not None:
+        servers = INTERMEDIATE_CACHE[best_zone][:]
+
+    while servers:
+        server = servers.pop(0)
+
+        try:
+            response = dns.query.udp(outbound_query, server, timeout=3)
+        except Exception:
+            continue
+
+        if response.answer:
+            cname_target = None
+
+            for answers in response.answer:
+                for answer in answers:
+                    if answer.rdtype == dns.rdatatype.CNAME:
+                        cname_target = answer.target
+
+            if cname_target:
+                next_response = lookup(cname_target, qtype)
+
+                for answers in response.answer:
+                    if answers not in next_response.answer:
+                        next_response.answer.insert(0, answers)
+
+                EXACT_CACHE[cache_key] = next_response
+                return next_response
+
+            EXACT_CACHE[cache_key] = response
+            return response
+
+        new_servers = []
+        ns_names = []
+        referral_zone = None
+
+        for record in response.authority:
+            if record.rdtype == dns.rdatatype.NS:
+                referral_zone = record.name
+                for item in record:
+                    ns_names.append(item.target)
+
+        for ns_name in ns_names:
+            found_glue = False
+
+            for record in response.additional:
+                if record.name == ns_name:
+                    for item in record:
+                        if item.rdtype == dns.rdatatype.A:
+                            new_servers.append(str(item))
+                            found_glue = True
+
+            if not found_glue:
+                ns_query = dns.message.make_query(ns_name, dns.rdatatype.A)
+                ns_servers = list(ROOT_SERVERS)
+
+                best_ns_zone = None
+
+                for zone in INTERMEDIATE_CACHE:
+                    if ns_name.is_subdomain(zone):
+                        if best_ns_zone is None or len(zone) > len(best_ns_zone):
+                            best_ns_zone = zone
+
+                if best_ns_zone is not None:
+                    ns_servers = INTERMEDIATE_CACHE[best_ns_zone][:]
+
+                ns_queried = set()
+                ns_ip_found = False
+
+                while ns_servers and not ns_ip_found:
+                    ns_server = ns_servers.pop(0)
+
+                    if ns_server in ns_queried:
+                        continue
+
+                    ns_queried.add(ns_server)
+
+                    try:
+                        ns_response = dns.query.udp(ns_query, ns_server, timeout=3)
+                    except Exception:
+                        continue
+
+                    if ns_response.answer:
+                        for answers in ns_response.answer:
+                            for answer in answers:
+                                if answer.rdtype == dns.rdatatype.A:
+                                    new_servers.append(str(answer))
+                                    ns_ip_found = True
+
+                        if ns_ip_found:
+                            break
+
+                    ns_names = []
+
+                    for record in ns_response.authority:
+                        if record.rdtype == dns.rdatatype.NS:
+                            for item in record:
+                                ns_names.append(item.target)
+
+                    next_ns_servers = []
+
+                    for record in ns_response.additional:
+                        for item in record:
+                            if item.rdtype == dns.rdatatype.A:
+                                next_ns_servers.append(str(item))
+
+                    if next_ns_servers:
+                        ns_servers = next_ns_servers
+                    else:
+                        for referral_ns_name in ns_names:
+                            if referral_ns_name in NS_LOOKUPS_IN_PROGRESS:
+                                continue
+
+                            NS_LOOKUPS_IN_PROGRESS.add(referral_ns_name)
+
+                            try:
+                                ns_ip_response = lookup(referral_ns_name, dns.rdatatype.A)
+                            finally:
+                                NS_LOOKUPS_IN_PROGRESS.remove(referral_ns_name)
+
+                            for answers in ns_ip_response.answer:
+                                for answer in answers:
+                                    if answer.rdtype == dns.rdatatype.A:
+                                        next_ns_servers.append(str(answer))
+
+                        if next_ns_servers:
+                            ns_servers = next_ns_servers
+
+        if new_servers:
+            if referral_zone:
+                INTERMEDIATE_CACHE[referral_zone] = new_servers[:]
+            servers = new_servers
+
+    return dns.message.make_response(outbound_query)
 
 
 def print_results(results: dict) -> None:
