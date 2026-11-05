@@ -103,6 +103,8 @@ def lookup(target_name: dns.name.Name,
         return EXACT_CACHE[cache_key]
 
     outbound_query = dns.message.make_query(target_name, qtype)
+    outbound_query.flags &= ~dns.flags.RD
+
     servers = list(ROOT_SERVERS)
     best_zone = None
 
@@ -114,13 +116,37 @@ def lookup(target_name: dns.name.Name,
     if best_zone is not None:
         servers = INTERMEDIATE_CACHE[best_zone][:]
 
+    queried = set()
+
     while servers:
         server = servers.pop(0)
+
+        if server in queried:
+            continue
+
+        queried.add(server)
 
         try:
             response = dns.query.udp(outbound_query, server, timeout=3)
         except Exception:
             continue
+
+        if response.rcode() == dns.rcode.NXDOMAIN:
+            EXACT_CACHE[cache_key] = response
+            return response
+
+        if response.rcode() != dns.rcode.NOERROR:
+            continue
+
+        if not response.answer:
+            has_soa = any(
+                record.rdtype == dns.rdatatype.SOA
+                for record in response.authority
+            )
+
+            if has_soa:
+                EXACT_CACHE[cache_key] = response
+                return response
 
         if response.answer:
             cname_target = None
@@ -165,6 +191,8 @@ def lookup(target_name: dns.name.Name,
 
             if not found_glue:
                 ns_query = dns.message.make_query(ns_name, dns.rdatatype.A)
+                ns_query.flags &= ~dns.flags.RD
+
                 ns_servers = list(ROOT_SERVERS)
 
                 best_ns_zone = None
@@ -187,6 +215,9 @@ def lookup(target_name: dns.name.Name,
                         continue
 
                     ns_queried.add(ns_server)
+
+                    print("NESTED TRYING:", ns_name, "SERVER:", ns_server)
+                    print("NESTED REMAINING:", ns_servers)
 
                     try:
                         ns_response = dns.query.udp(ns_query, ns_server, timeout=3)
@@ -244,8 +275,9 @@ def lookup(target_name: dns.name.Name,
                 INTERMEDIATE_CACHE[referral_zone] = new_servers[:]
             servers = new_servers
 
-    return dns.message.make_response(outbound_query)
-
+    failure_response = dns.message.make_response(outbound_query)
+    failure_response.set_rcode(dns.rcode.SERVFAIL)
+    return failure_response
 
 def print_results(results: dict) -> None:
     """
