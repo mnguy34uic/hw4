@@ -190,6 +190,15 @@ def lookup(target_name: dns.name.Name,
                             found_glue = True
 
             if not found_glue:
+                ns_cache_key = (ns_name, dns.rdatatype.A)
+
+                if ns_cache_key in EXACT_CACHE:
+                    for answers in EXACT_CACHE[ns_cache_key].answer:
+                        for answer in answers:
+                            if answer.rdtype == dns.rdatatype.A:
+                                new_servers.append(str(answer))
+                    continue
+
                 ns_query = dns.message.make_query(ns_name, dns.rdatatype.A)
                 ns_query.flags &= ~dns.flags.RD
 
@@ -216,9 +225,6 @@ def lookup(target_name: dns.name.Name,
 
                     ns_queried.add(ns_server)
 
-                    print("NESTED TRYING:", ns_name, "SERVER:", ns_server)
-                    print("NESTED REMAINING:", ns_servers)
-
                     try:
                         ns_response = dns.query.udp(ns_query, ns_server, timeout=3)
                     except Exception:
@@ -232,6 +238,7 @@ def lookup(target_name: dns.name.Name,
                                     ns_ip_found = True
 
                         if ns_ip_found:
+                            EXACT_CACHE[ns_cache_key] = ns_response
                             break
 
                     ns_names = []
