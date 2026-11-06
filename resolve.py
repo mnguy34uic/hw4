@@ -251,9 +251,10 @@ def lookup(target_name: dns.name.Name,
                     next_ns_servers = []
 
                     for record in ns_response.additional:
-                        for item in record:
-                            if item.rdtype == dns.rdatatype.A:
-                                next_ns_servers.append(str(item))
+                        if record.name in referral_ns_names:
+                            for item in record:
+                                if item.rdtype == dns.rdatatype.A:
+                                    next_ns_servers.append(str(item))
 
                     if next_ns_servers:
                         ns_servers = next_ns_servers
