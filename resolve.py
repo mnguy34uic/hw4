@@ -97,6 +97,9 @@ def lookup(target_name: dns.name.Name,
     TODO: replace this implementation with one which asks the root servers
     and recurses to find the proper answer.
     """
+    timeout = 3
+    max_nested = 10
+
     cache_key = (target_name, qtype)
 
     if cache_key in EXACT_CACHE:
@@ -105,187 +108,167 @@ def lookup(target_name: dns.name.Name,
     outbound_query = dns.message.make_query(target_name, qtype)
     outbound_query.flags &= ~dns.flags.RD
 
-    servers = list(ROOT_SERVERS)
-    best_zone = None
+    def failure():
+        response = dns.message.make_response(outbound_query)
+        response.set_rcode(dns.rcode.SERVFAIL)
+        return response
 
-    for zone in INTERMEDIATE_CACHE:
-        if target_name.is_subdomain(zone):
-            if best_zone is None or len(zone) > len(best_zone):
-                best_zone = zone
+    top_level = not NS_LOOKUPS_IN_PROGRESS
 
-    if best_zone is not None:
-        servers = INTERMEDIATE_CACHE[best_zone][:]
+    if (cache_key in NS_LOOKUPS_IN_PROGRESS or len(NS_LOOKUPS_IN_PROGRESS) >= max_nested):
+        return failure()
 
     queried = set()
 
-    while servers:
-        server = servers.pop(0)
+    def handle_answer(response):
+        owners = set()
+        cname_targets = []
 
-        if server in queried:
-            continue
+        for rrset in response.answer:
+            owners.add(rrset.name)
 
-        queried.add(server)
+            if rrset.rdtype == dns.rdatatype.CNAME:
+                for item in rrset:
+                    cname_targets.append(item.target)
 
-        try:
-            response = dns.query.udp(outbound_query, server, timeout=3)
-        except Exception:
-            continue
+        pending = [t for t in cname_targets if t not in owners]
+        has_final = qtype != dns.rdatatype.CNAME and any(rrset.rdtype == qtype for rrset in response.answer)
 
-        if response.rcode() == dns.rcode.NXDOMAIN:
-            EXACT_CACHE[cache_key] = response
+        if has_final or not pending:
             return response
 
-        if response.rcode() != dns.rcode.NOERROR:
-            continue
+        next_response = lookup(pending[-1], qtype)
 
-        if not response.answer:
-            has_soa = any(
-                record.rdtype == dns.rdatatype.SOA
-                for record in response.authority
-            )
+        combined = dns.message.make_response(outbound_query)
+        combined.set_rcode(next_response.rcode())
+        combined.answer = list(response.answer)
 
-            if has_soa:
-                EXACT_CACHE[cache_key] = response
+        for rrset in next_response.answer:
+            if rrset not in combined.answer:
+                combined.answer.append(rrset)
+
+        combined.authority = list(next_response.authority)
+
+        return combined
+
+    def query_servers(servers):
+        for server in servers:
+            if server in queried:
+                continue
+
+            queried.add(server)
+
+            try:
+                response = dns.query.udp(outbound_query, server, timeout=timeout)
+            except Exception:
+                continue
+
+            if response.rcode() == dns.rcode.NXDOMAIN:
+                return response
+            if response.rcode() != dns.rcode.NOERROR:
+                continue
+
+            if response.answer:
+                return handle_answer(response)
+
+            if any(r.rdtype == dns.rdatatype.SOA for r in response.authority):
                 return response
 
-        if response.answer:
-            cname_target = None
+            referral_zone = None
+            ns_names = []
 
-            for answers in response.answer:
-                for answer in answers:
-                    if answer.rdtype == dns.rdatatype.CNAME:
-                        cname_target = answer.target
+            for rrset in response.authority:
+                if rrset.rdtype == dns.rdatatype.NS:
+                    referral_zone = rrset.name
 
-            if cname_target:
-                next_response = lookup(cname_target, qtype)
+                    for item in rrset:
+                        ns_names.append(item.target)
 
-                for answers in response.answer:
-                    if answers not in next_response.answer:
-                        next_response.answer.insert(0, answers)
+            if (referral_zone is None or not target_name.is_subdomain(referral_zone)):
+                continue
 
-                EXACT_CACHE[cache_key] = next_response
-                return next_response
+            glue = []
+            unglue = []
 
-            EXACT_CACHE[cache_key] = response
-            return response
+            for ns_name in ns_names:
+                addresses = []
 
-        new_servers = []
-        ns_names = []
-        referral_zone = None
+                for rrset in response.additional:
+                    if (rrset.name == ns_name and rrset.rdtype == dns.rdatatype.A):
+                        addresses.extend(str(item) for item in rrset)
 
-        for record in response.authority:
-            if record.rdtype == dns.rdatatype.NS:
-                referral_zone = record.name
-                for item in record:
-                    ns_names.append(item.target)
+                if addresses:
+                    for address in addresses:
+                        if address not in glue:
+                            glue.append(address)
+                else:
+                    unglue.append(ns_name)
 
-        for ns_name in ns_names:
-            found_glue = False
+            if glue:
+                INTERMEDIATE_CACHE[referral_zone] = list(glue)
+                result = query_servers(glue)
 
-            for record in response.additional:
-                if record.name == ns_name:
-                    for item in record:
-                        if item.rdtype == dns.rdatatype.A:
-                            new_servers.append(str(item))
-                            found_glue = True
+                if result is not None:
+                    return result
 
-            if not found_glue:
-                ns_cache_key = (ns_name, dns.rdatatype.A)
-
-                if ns_cache_key in EXACT_CACHE:
-                    for answers in EXACT_CACHE[ns_cache_key].answer:
-                        for answer in answers:
-                            if answer.rdtype == dns.rdatatype.A:
-                                new_servers.append(str(answer))
+            for ns_name in unglue:
+                if (ns_name, dns.rdatatype.A) in NS_LOOKUPS_IN_PROGRESS:
                     continue
 
-                ns_query = dns.message.make_query(ns_name, dns.rdatatype.A)
-                ns_query.flags &= ~dns.flags.RD
+                ns_response = lookup(ns_name, dns.rdatatype.A)
 
-                ns_servers = list(ROOT_SERVERS)
+                addresses = []
 
-                best_ns_zone = None
+                for rrset in ns_response.answer:
+                    if rrset.rdtype == dns.rdatatype.A:
+                        addresses.extend(str(item) for item in rrset)
 
-                for zone in INTERMEDIATE_CACHE:
-                    if ns_name.is_subdomain(zone):
-                        if best_ns_zone is None or len(zone) > len(best_ns_zone):
-                            best_ns_zone = zone
+                if not addresses:
+                    EXACT_CACHE[(ns_name, dns.rdatatype.A)] = ns_response
+                    continue
 
-                if best_ns_zone is not None:
-                    ns_servers = INTERMEDIATE_CACHE[best_ns_zone][:]
+                known = INTERMEDIATE_CACHE.setdefault(referral_zone, [])
 
-                ns_queried = set()
-                ns_ip_found = False
+                for address in addresses:
+                    if address not in known:
+                        known.append(address)
 
-                while ns_servers and not ns_ip_found:
-                    ns_server = ns_servers.pop(0)
+                result = query_servers(addresses)
 
-                    if ns_server in ns_queried:
-                        continue
+                if result is not None:
+                    return result
 
-                    ns_queried.add(ns_server)
+        return None
 
-                    try:
-                        ns_response = dns.query.udp(ns_query, ns_server, timeout=3)
-                    except Exception:
-                        continue
+    NS_LOOKUPS_IN_PROGRESS.add(cache_key)
 
-                    if ns_response.answer:
-                        for answers in ns_response.answer:
-                            for answer in answers:
-                                if answer.rdtype == dns.rdatatype.A:
-                                    new_servers.append(str(answer))
-                                    ns_ip_found = True
+    try:
+        best_zone = None
 
-                        if ns_ip_found:
-                            EXACT_CACHE[ns_cache_key] = ns_response
-                            break
+        for zone in INTERMEDIATE_CACHE:
+            if target_name.is_subdomain(zone):
+                if best_zone is None or len(zone) > len(best_zone):
+                    best_zone = zone
 
-                    referral_ns_names = []
+        if best_zone is not None and INTERMEDIATE_CACHE[best_zone]:
+            start_servers = list(INTERMEDIATE_CACHE[best_zone])
+        else:
+            start_servers = list(ROOT_SERVERS)
 
-                    for record in ns_response.authority:
-                        if record.rdtype == dns.rdatatype.NS:
-                            for item in record:
-                                referral_ns_names.append(item.target)
+        result = query_servers(start_servers)
+    finally:
+        NS_LOOKUPS_IN_PROGRESS.discard(cache_key)
 
-                    next_ns_servers = []
+    if result is None:
+        result = failure()
 
-                    for record in ns_response.additional:
-                        if record.name in referral_ns_names:
-                            for item in record:
-                                if item.rdtype == dns.rdatatype.A:
-                                    next_ns_servers.append(str(item))
+        if top_level:
+            EXACT_CACHE[cache_key] = result
 
-                    if next_ns_servers:
-                        ns_servers = next_ns_servers
-                    else:
-                        for referral_ns_name in referral_ns_names:
-                            if referral_ns_name in NS_LOOKUPS_IN_PROGRESS:
-                                continue
+        return result
 
-                            NS_LOOKUPS_IN_PROGRESS.add(referral_ns_name)
-
-                            try:
-                                ns_ip_response = lookup(referral_ns_name, dns.rdatatype.A)
-                            finally:
-                                NS_LOOKUPS_IN_PROGRESS.remove(referral_ns_name)
-
-                            for answers in ns_ip_response.answer:
-                                for answer in answers:
-                                    if answer.rdtype == dns.rdatatype.A:
-                                        next_ns_servers.append(str(answer))
-
-                        if next_ns_servers:
-                            ns_servers = next_ns_servers
-
-        if new_servers:
-            if referral_zone:
-                INTERMEDIATE_CACHE[referral_zone] = new_servers[:]
-            servers = new_servers
-
-    failure_response = dns.message.make_response(outbound_query)
-    failure_response.set_rcode(dns.rcode.SERVFAIL)
-    return failure_response
+    EXACT_CACHE[cache_key] = result
+    return result
 
 def print_results(results: dict) -> None:
     """
