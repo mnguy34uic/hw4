@@ -241,12 +241,12 @@ def lookup(target_name: dns.name.Name,
                             EXACT_CACHE[ns_cache_key] = ns_response
                             break
 
-                    ns_names = []
+                    referral_ns_names = []
 
                     for record in ns_response.authority:
                         if record.rdtype == dns.rdatatype.NS:
                             for item in record:
-                                ns_names.append(item.target)
+                                referral_ns_names.append(item.target)
 
                     next_ns_servers = []
 
@@ -258,7 +258,7 @@ def lookup(target_name: dns.name.Name,
                     if next_ns_servers:
                         ns_servers = next_ns_servers
                     else:
-                        for referral_ns_name in ns_names:
+                        for referral_ns_name in referral_ns_names:
                             if referral_ns_name in NS_LOOKUPS_IN_PROGRESS:
                                 continue
 
