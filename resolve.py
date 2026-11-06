@@ -93,6 +93,7 @@ def lookup(target_name: dns.name.Name,
     TODO: replace this implementation with one which asks the root servers
     and recurses to find the proper answer.
     """
+
     if not hasattr(lookup, "exact_cache"):
         lookup.exact_cache = {}
         lookup.intermediate_cache = {}
@@ -114,8 +115,6 @@ def lookup(target_name: dns.name.Name,
         response = dns.message.make_response(outbound_query)
         response.set_rcode(dns.rcode.SERVFAIL)
         return response
-
-    top_level = not in_progress
 
     if (cache_key in in_progress or len(in_progress) >= 10):
         return failure()
@@ -263,11 +262,6 @@ def lookup(target_name: dns.name.Name,
 
     if result is None:
         result = failure()
-
-        if top_level:
-            exact_cache[cache_key] = result
-
-        return result
 
     exact_cache[cache_key] = result
     return result
