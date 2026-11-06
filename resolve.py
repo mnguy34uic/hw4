@@ -30,10 +30,6 @@ ROOT_SERVERS = ("198.41.0.4",
                 "199.7.83.42",
                 "202.12.27.33")
 
-EXACT_CACHE = {}
-INTERMEDIATE_CACHE = {}
-NS_LOOKUPS_IN_PROGRESS = set()
-
 def collect_results(name: str) -> dict:
     """
     This function parses final answers into the proper data structure that
@@ -97,13 +93,19 @@ def lookup(target_name: dns.name.Name,
     TODO: replace this implementation with one which asks the root servers
     and recurses to find the proper answer.
     """
-    timeout = 3
-    max_nested = 10
+    if not hasattr(lookup, "exact_cache"):
+        lookup.exact_cache = {}
+        lookup.intermediate_cache = {}
+        lookup.in_progress = set()
+    
+    exact_cache = lookup.exact_cache
+    intermediate_cache = lookup.intermediate_cache
+    in_progress = lookup.in_progress
 
     cache_key = (target_name, qtype)
 
-    if cache_key in EXACT_CACHE:
-        return EXACT_CACHE[cache_key]
+    if cache_key in exact_cache:
+        return exact_cache[cache_key]
 
     outbound_query = dns.message.make_query(target_name, qtype)
     outbound_query.flags &= ~dns.flags.RD
@@ -113,9 +115,9 @@ def lookup(target_name: dns.name.Name,
         response.set_rcode(dns.rcode.SERVFAIL)
         return response
 
-    top_level = not NS_LOOKUPS_IN_PROGRESS
+    top_level = not in_progress
 
-    if (cache_key in NS_LOOKUPS_IN_PROGRESS or len(NS_LOOKUPS_IN_PROGRESS) >= max_nested):
+    if (cache_key in in_progress or len(in_progress) >= 10):
         return failure()
 
     queried = set()
@@ -159,7 +161,7 @@ def lookup(target_name: dns.name.Name,
             queried.add(server)
 
             try:
-                response = dns.query.udp(outbound_query, server, timeout=timeout)
+                response = dns.query.udp(outbound_query, server, timeout=3)
             except Exception:
                 continue
 
@@ -205,14 +207,14 @@ def lookup(target_name: dns.name.Name,
                     unglue.append(ns_name)
 
             if glue:
-                INTERMEDIATE_CACHE[referral_zone] = list(glue)
+                intermediate_cache[referral_zone] = list(glue)
                 result = query_servers(glue)
 
                 if result is not None:
                     return result
 
             for ns_name in unglue:
-                if (ns_name, dns.rdatatype.A) in NS_LOOKUPS_IN_PROGRESS:
+                if (ns_name, dns.rdatatype.A) in in_progress:
                     continue
 
                 ns_response = lookup(ns_name, dns.rdatatype.A)
@@ -224,10 +226,10 @@ def lookup(target_name: dns.name.Name,
                         addresses.extend(str(item) for item in rrset)
 
                 if not addresses:
-                    EXACT_CACHE[(ns_name, dns.rdatatype.A)] = ns_response
+                    exact_cache[(ns_name, dns.rdatatype.A)] = ns_response
                     continue
 
-                known = INTERMEDIATE_CACHE.setdefault(referral_zone, [])
+                known = intermediate_cache.setdefault(referral_zone, [])
 
                 for address in addresses:
                     if address not in known:
@@ -240,34 +242,34 @@ def lookup(target_name: dns.name.Name,
 
         return None
 
-    NS_LOOKUPS_IN_PROGRESS.add(cache_key)
+    in_progress.add(cache_key)
 
     try:
         best_zone = None
 
-        for zone in INTERMEDIATE_CACHE:
+        for zone in intermediate_cache:
             if target_name.is_subdomain(zone):
                 if best_zone is None or len(zone) > len(best_zone):
                     best_zone = zone
 
-        if best_zone is not None and INTERMEDIATE_CACHE[best_zone]:
-            start_servers = list(INTERMEDIATE_CACHE[best_zone])
+        if best_zone is not None and intermediate_cache[best_zone]:
+            start_servers = list(intermediate_cache[best_zone])
         else:
             start_servers = list(ROOT_SERVERS)
 
         result = query_servers(start_servers)
     finally:
-        NS_LOOKUPS_IN_PROGRESS.discard(cache_key)
+        in_progress.discard(cache_key)
 
     if result is None:
         result = failure()
 
         if top_level:
-            EXACT_CACHE[cache_key] = result
+            exact_cache[cache_key] = result
 
         return result
 
-    EXACT_CACHE[cache_key] = result
+    exact_cache[cache_key] = result
     return result
 
 def print_results(results: dict) -> None:
